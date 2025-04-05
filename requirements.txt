@@ -1,0 +1,7 @@
+numpy
+faiss-cpu
+transformers
+torch
+sacremoses
+protobuf
+accelerate>=0.26.0
