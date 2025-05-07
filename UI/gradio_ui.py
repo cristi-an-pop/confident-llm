@@ -1,8 +1,87 @@
 import json
 import gradio as gr
+import torch
+import faiss
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from sentence_transformers import SentenceTransformer
 
+# Determine the script’s directory, then build absolute paths
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR   = os.path.abspath(os.path.join(BASE_DIR, "..", "finetuned_biogpt"))
+INDEX_PATH  = os.path.abspath(os.path.join(BASE_DIR, "..", "faiss_index.index"))
+META_PATH   = os.path.abspath(os.path.join(BASE_DIR, "..", "faiss_index_meta.json"))
+
+# --- 1) Load your fine-tuned BioGPT model + tokenizer (local only) ---
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_DIR,
+    local_files_only=True
+)
+tokenizer.pad_token = tokenizer.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_DIR,
+    local_files_only=True
+)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device).eval()
+
+# --- 2) Load your FAISS index + metadata ---
+index = faiss.read_index(INDEX_PATH)
+with open(META_PATH, "r", encoding="utf-8") as f:
+    metadata = json.load(f)
+
+# --- 3) Load your Embedder ---
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# --- 4) Bring in your pipeline functions (or define inline) ---
+def faiss_retrieve(query, index, metadata, embedder, top_k=3):
+    q_vec = embedder.encode([query], convert_to_numpy=True).astype("float32")
+    D, I = index.search(q_vec, top_k)
+    return [metadata[i] for i in I[0] if i < len(metadata)]
+
+def rerank_chunks(chunks, query):
+    return sorted(chunks, key=lambda x: len(x["answer"]), reverse=True)
+
+def rag_engine(query, chunks, model, tokenizer, max_length=256):
+    if not chunks:
+        return "No relevant context found."
+    top = chunks[0]
+    prompt = (
+        "You are an expert in oral health.  Use ONLY the patient info below and do NOT repeat it.\n\n"
+        f"Patient excerpt:\n"
+        f"  • Q: {top['question']}\n"
+        f"  • A: {top['answer']}\n\n"
+        f"User question: {query}\n"
+        "Answer concisely:"
+    )
+    inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+    out = model.generate(
+        inputs,
+        max_length=max_length,
+        temperature=0.5,
+        top_p=0.8,
+        no_repeat_ngram_size=4,
+        num_beams=2,
+        early_stopping=True
+    )
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    return text.replace(prompt, "").strip()
+
+def toxicity_and_hallucination_filter(resp):
+    blocked = ["badword1","badword2"]
+    low = resp.lower()
+    return "Content removed due to policy." if any(b in low for b in blocked) else resp
+
+def generate_response(query):
+    retrieved = faiss_retrieve(query, index, metadata, embedder, top_k=3)
+    reranked  = rerank_chunks(retrieved, query)
+    raw       = rag_engine(query, reranked, model, tokenizer)
+    return toxicity_and_hallucination_filter(raw)
+
+# --- 5) Override get_answer to call your real pipeline ---
 def get_answer(user_message):
-    return f"This is a dummy answer for: '{user_message}'"
+    return generate_response(user_message)
 
 def update_history(user_message, history_json):
     history = json.loads(history_json) if history_json else []
